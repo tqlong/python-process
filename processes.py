@@ -1,11 +1,11 @@
-from multiprocessing import Process, Queue, Lock
+from multiprocessing import Process, Queue, Lock, Value
+import multiprocessing as mp
 from threading import Thread
 import cv2
 import numpy as np
 import time
 import face_recognition as fr
 from queue import PriorityQueue, Full, Empty
-
 
 class MyQueue():
     def __init__(self, name, maxsize=30):
@@ -43,16 +43,18 @@ class MyQueue():
 
 
 class Worker(Process):
-    def __init__(self, iqueue=None, oqueues=None, processor=None):
+    def __init__(self, wait_for_init, iqueue=None, oqueues=None, processor=None):
         super(Worker, self).__init__()
         self.iqueue = iqueue
         self.oqueues = oqueues
         self.processor = processor
         self.deamon = True
+        self.wait_for_init = wait_for_init
 
     def run(self):
         self.processor.init()
-        print(self.processor.name, "init")
+        self.wait_for_other_process_init()
+
         oqueue_idx = 0
         while True:
             item = self.iqueue.qget(2) if self.iqueue is not None else -1
@@ -69,6 +71,13 @@ class Worker(Process):
                 break
         print(self.processor.name, "done")
 
+    def wait_for_other_process_init(self):
+        print(self.processor.name, "done init")
+        self.wait_for_init.value -= 1
+        while self.wait_for_init.value > 0:
+            # print(self.processor.name, self.wait_for_init.value)
+            time.sleep(0.5)
+        print(self.processor.name, self.wait_for_init.value, "done waiting")
 
 class VideoCaptureProcessor:
     def __init__(self, path):
@@ -116,7 +125,7 @@ class VideoRenderProcessor:
         stop = False
         start_time, count, total = time.time(), 0, 0
         while not stop:
-            time.sleep(0.005)
+            time.sleep(0.01)
             while not self.storage.empty():
                 try:
                     idx, item = self.storage.get()
@@ -124,7 +133,7 @@ class VideoRenderProcessor:
                     total += 1
                     if count % 100 == 0:
                         print("output fps", count /
-                              (time.time()-start_time), "total", total)
+                              (time.time()-start_time), "total", total, idx, currentIdx)
                         start_time, count = time.time(), 0
                     if idx > currentIdx:
                         currentIdx = idx
@@ -141,6 +150,8 @@ class VideoRenderProcessor:
             for top, right, bottom, left in face_locations:
                 cv2.rectangle(output, (left, top),
                               (right, bottom), (0, 0, 255), 2)
+        
+        cv2.putText(output, str(idx), (0, 40), cv2.FONT_HERSHEY_SIMPLEX, 2, (255,255,255),2,cv2.LINE_AA)
         # if 'face_landmarks_list' in item:
         #     for face_landmarks in item['face_landmarks_list']:
         #         for facial_feature in face_landmarks.keys():
@@ -165,7 +176,7 @@ class FaceLocator:
         # print("locator", self.name, idx)
         small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
         rgb_small_frame = small_frame[:, :, ::-1]
-        face_locations = fr.face_locations(rgb_small_frame)
+        face_locations = fr.face_locations(rgb_small_frame, model="cnn")
         item['face_locations'] = [(top*4, right*4, bottom*4, left*4)
                                   for top, right, bottom, left in face_locations]
         # item['face_landmarks_list'] = fr.face_landmarks(
@@ -177,16 +188,20 @@ class FaceLocator:
 
 
 if __name__ == "__main__":
-    n_locator = 15
+    mp.set_start_method('spawn')
+    n_locator = 8
     frameq = [MyQueue("frameq "+str(i)) for i in range(n_locator)]
     faceq = MyQueue("faceq")
+
+    num_init = Value('i', n_locator + 2)
     video_capture = Worker(oqueues=frameq, processor=VideoCaptureProcessor(
-        path="/home/tqlong/Downloads/video.mp4"))
+        path="/home/tqlong/Downloads/video.mp4"), wait_for_init=num_init)
     face_locators = [Worker(iqueue=frameq[i], oqueues=[faceq],
-                            processor=FaceLocator(i)) for i in range(n_locator)]
+                            processor=FaceLocator(i), wait_for_init=num_init) for i in range(n_locator)]
     video_render = Worker(iqueue=faceq, oqueues=None,
-                          processor=VideoRenderProcessor())
+                          processor=VideoRenderProcessor(), wait_for_init=num_init)
 
     processes = [video_capture, video_render] + face_locators
     [t.start() for t in processes]
     [t.join() for t in processes]
+
